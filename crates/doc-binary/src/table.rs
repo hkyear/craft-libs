@@ -389,8 +389,18 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
         if rows.is_empty() {
             return;
         }
+        // A table whose rows carry no width intent (no `sprmTCellWidth`, no percentage
+        // widths) keeps its widths only in the `sprmTDefTable` boundary array. Word shows
+        // those boundaries; without a layout hint the layout engine content-fits every
+        // column, and boundary-only tables (government and exam forms) collapse. Declare
+        // the table fixed at its saved total so the grid stands as written.
+        let mut props = props.clone();
+        if !rows.iter().any(|r| r.cells.iter().any(|c| c.props.width.is_some() || c.props.width_pct.is_some())) {
+            props.fixed = true;
+            props.width = Some(grid.iter().sum());
+        }
         out.push(Arc::new(Block::Table(Table {
-            props: props.clone(),
+            props,
             grid: grid.to_vec(),
             rows: std::mem::take(rows),
             controls: Default::default(),
