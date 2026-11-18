@@ -397,9 +397,6 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
                 }
             }
         }
-        if std::env::var_os("CRAFT_DOCBIN_DEBUG").is_some() {
-            eprintln!("[finish] edges={edges:?} cells={} spans={:?} merges={:?} unified={}cols", cells.len(), cells.iter().map(|c| c.props.span).collect::<Vec<_>>(), info.merges, unified.len().saturating_sub(1));
-        }
         // Horizontal merges: (itcFirst, itcLim) ranges in pre-merge cell indices; the
         // merged cell spans the sum of the cells it joins.
         let mut cells = cells;
@@ -497,16 +494,8 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
         })));
     }
 
-    let dbg = std::env::var_os("CRAFT_DOCBIN_DEBUG").is_some();
     while let Some(next) = paras.peek() {
         let next_level = next.row.as_ref().map_or(0, |r| r.level());
-        if dbg && next.row.is_some() {
-            let r = next.row.as_ref().unwrap();
-            eprintln!(
-                "[mark] lvl={} in_table={} ttp={} cell_mark={} inner_cell={} inner_ttp={} edges={} depth={} text={:?}",
-                r.level(), r.in_table, r.ttp, r.cell_mark, r.inner_cell, r.inner_ttp, r.edges.len(), r.depth, next.para.text.as_str().chars().take(12).collect::<String>()
-            );
-        }
         if level > 1 && next_level < level {
             break;
         }
