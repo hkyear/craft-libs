@@ -71,10 +71,11 @@ pub(crate) struct RowInfo {
     inner_cell: bool,
     /// `sprmPFInnerTtp`: the mark ends a row of a nested table.
     inner_ttp: bool,
-    /// Cell-edge positions (points) from `sprmTDefTable` — [MS-DOC] defines them per row,
-    /// so each row keeps its own; ascending in well-formed rows, the first edge usually 0
-    /// (the row origin). Rows without a `sprmTDefTable` keep this empty.
-    pub(crate) edges: Vec<f32>,
+    /// Cell-edge positions from `sprmTDefTable`, in the file's native i16 twips — [MS-DOC]
+    /// defines them per row, so each row keeps its own; ascending in well-formed rows, the
+    /// first edge usually 0 (the row origin). Rows without a `sprmTDefTable` keep this empty.
+    /// Conversion to points happens once, at the model boundary.
+    pub(crate) edges: Vec<i16>,
     height: Option<f32>,
     height_rule: HeightRule,
     header: bool,
@@ -89,8 +90,9 @@ pub(crate) struct RowInfo {
     /// Later entries win: the `Shd` arrays override the `Shd80` fallback before them, and an
     /// automatic `Shd` (`None`) clears it.
     shading: Vec<(u8, Option<Rgb>)>,
-    widths: Vec<(u8, f32)>,
-    width_pcts: Vec<(u8, f32)>,
+    /// Native sprm units: twips (ftsWidth 3) and 50ths of a percent (ftsWidth 2).
+    widths: Vec<(u8, i16)>,
+    width_pcts: Vec<(u8, u16)>,
     valign: Vec<(u8, VAlign)>,
 }
 
@@ -127,7 +129,7 @@ impl RowInfo {
     /// The width cell `i` ends up with, for tests.
     #[cfg(test)]
     pub(crate) fn width_of(&self, i: u8) -> Option<f32> {
-        self.widths.iter().rfind(|(k, _)| *k == i).map(|(_, w)| *w)
+        self.widths.iter().rfind(|(k, _)| *k == i).map(|(_, w)| *w as f32 / 20.0)
     }
 
     /// How many per-cell overrides the row keeps, for tests.
@@ -139,7 +141,7 @@ impl RowInfo {
     /// The width percentage cell `i` ends up with, for tests.
     #[cfg(test)]
     pub(crate) fn width_pct_of(&self, i: u8) -> Option<f32> {
-        self.width_pcts.iter().rfind(|(k, _)| *k == i).map(|(_, w)| *w)
+        self.width_pcts.iter().rfind(|(k, _)| *k == i).map(|(_, w)| *w as f32 / 50.0)
     }
 }
 
@@ -256,12 +258,13 @@ pub(crate) fn decode(papx: &[u8]) -> RowInfo {
                 // ftsWidth: 3 = twips (dxa), 2 = percentage (50ths of a percent).
                 if let [_, a, b, fts, w0, w1, ..] = prl.operand {
                     if *fts == 3 {
-                        let w = (i16::from_le_bytes([*w0, *w1]) as f32 / 20.0).clamp(0.0, 1584.0);
+                        // 1584 pt = 31680 twips, the clamp the old f32 path applied.
+                        let w = i16::from_le_bytes([*w0, *w1]).clamp(0, 31680);
                         for c in *a..(*b).min(MAX_COLS as u8) {
                             set(&mut r.widths, c, w);
                         }
                     } else if *fts == 2 {
-                        let pct = (u16::from_le_bytes([*w0, *w1]) as f32 / 50.0).clamp(0.0, 100.0);
+                        let pct = u16::from_le_bytes([*w0, *w1]).min(5000);
                         for c in *a..(*b).min(MAX_COLS as u8) {
                             set(&mut r.width_pcts, c, pct);
                         }
@@ -333,7 +336,7 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
     /// shadows folded into the previous cell, horizontal merges span the sum of the cells
     /// they join, and a row narrower than the table gains empty leading/trailing cells
     /// (LibreOffice's empty edge columns) so every row spans the whole grid.
-    fn finish_row(cells: Vec<Cell>, info: &RowInfo, unified: &[f32]) -> Row {
+    fn finish_row(cells: Vec<Cell>, info: &RowInfo, unified: &[i16]) -> Row {
         let mut cells = cells;
         // Per-cell overrides first (sprm cell indices count pre-merge cells); merges map
         // below, after spans, so they span the sum of the cells they join.
@@ -343,10 +346,10 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
                 c.props.vmerge = *m;
             }
             if let Some((_, w)) = info.widths.iter().rfind(|(k, _)| *k == i) {
-                c.props.width = Some(*w);
+                c.props.width = Some(*w as f32 / 20.0);
             }
             if let Some((_, pct)) = info.width_pcts.iter().rfind(|(k, _)| *k == i) {
-                c.props.width_pct = Some(*pct);
+                c.props.width_pct = Some(*pct as f32 / 50.0);
             }
             if let Some((_, s)) = info.shading.iter().rfind(|(k, _)| *k == i) {
                 c.props.shading = *s;
@@ -358,9 +361,11 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
         let edges = &info.edges;
         if edges.len() >= 2 && cells.len() + 1 == edges.len() {
             // Spans first, in row-column space; merges below sum them.
+            // Exact integer comparison: edges and the unified grid share the file's
+            // twip unit, so no epsilon is needed at all.
             let span_of = |i: usize| -> u32 {
                 let (a, b) = (edges[i], edges[i + 1]);
-                unified.iter().filter(|&&g| g >= a - 0.01 && g < b - 0.01).count() as u32
+                unified.iter().filter(|&&g| g >= a && g < b).count() as u32
             };
             for i in 0..cells.len() {
                 let span = span_of(i);
@@ -380,8 +385,8 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
             let mut spans: u32 = cells.iter().map(|c| c.props.span).sum();
             let grid_cols = unified.len().saturating_sub(1) as u32;
             if grid_cols > 0 {
-                if edges[0] > unified[0] + 0.01 {
-                    let lead = unified.iter().filter(|&&g| g < edges[0] - 0.01).count() as u32;
+                if edges[0] > unified[0] {
+                    let lead = unified.iter().filter(|&&g| g < edges[0]).count() as u32;
                     if lead > 0 {
                         spans += lead;
                         cells.insert(0, Cell { props: CellProps { span: lead.min(63), ..Default::default() }, blocks: vec![para_block(Paragraph::new())], controls: Default::default() });
@@ -442,20 +447,25 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
         // `sprmTDefTable` edges, sorted and deduplicated. Rows may redefine the grid
         // per row (LibreOffice's bands); the union lets each row's own segmentation map
         // onto shared columns. Rows without any edges contribute nothing.
-        let mut unified: Vec<f32> = rows_raw.iter().filter(|(_, i, _)| i.edges.len() >= 2).flat_map(|(_, i, _)| i.edges.iter().copied()).collect();
-        unified.retain(|e| e.is_finite());
-        unified.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        unified.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        let mut unified: Vec<i16> = rows_raw.iter().filter(|(_, i, _)| i.edges.len() >= 2).flat_map(|(_, i, _)| i.edges.iter().copied()).collect();
+        unified.sort_unstable();
+        unified.dedup();
         if unified.len() < 2 || unified.len() > MAX_COLS + 1 {
             // Degenerate or over-wide unions fall back to the first row that has edges.
             unified = rows_raw.iter().find(|(_, i, _)| i.edges.len() >= 2).map_or(Vec::new(), |(_, i, _)| {
-                let mut e: Vec<f32> = i.edges.iter().copied().filter(|x| x.is_finite()).collect();
-                e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                e.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+                let mut e: Vec<i16> = i.edges.iter().copied().collect();
+                e.sort_unstable();
+                e.dedup();
                 e
             });
         }
-        let grid: Vec<f32> = unified.windows(2).map(|w| (w[1] - w[0]).max(0.0)).take(MAX_COLS).collect();
+        // One conversion to points at the model boundary; i16 differences may exceed
+        // i16's range, so widen for the subtraction.
+        let grid: Vec<f32> = unified
+            .windows(2)
+            .map(|w| ((w[1] as i32 - w[0] as i32).max(0)) as f32 / 20.0)
+            .take(MAX_COLS)
+            .collect();
         let mut rows: Vec<Row> = Vec::with_capacity(rows_raw.len());
         for (cells, info, stray) in rows_raw.drain(..) {
             let mut row = finish_row(cells, &info, &unified);
@@ -594,7 +604,8 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
 /// Cell-edge positions (points) from a `sprmTDefTable` operand: cb u16, itcMac u8, then
 /// itcMac+1 twip boundaries followed by the TC80s (skipped). Edges are returned as stored:
 /// per-row, in operand order; sorting and capping happen when the table grid is assembled.
-fn def_table_edges(operand: &[u8]) -> Vec<f32> {
+/// Raw twip edges; the /20 to points happens once, when the model grid is built.
+fn def_table_edges(operand: &[u8]) -> Vec<i16> {
     let itc = operand.get(2).copied().unwrap_or(0) as usize;
     if itc == 0 {
         return Vec::new();
@@ -603,7 +614,7 @@ fn def_table_edges(operand: &[u8]) -> Vec<f32> {
     let mut edges = Vec::with_capacity((itc + 1).min(256));
     for i in 0..=itc {
         match operand.get(3 + i * 2..3 + i * 2 + 2) {
-            Some(b) => edges.push(i16::from_le_bytes([b[0], b[1]]) as f32 / 20.0),
+            Some(b) => edges.push(i16::from_le_bytes([b[0], b[1]])),
             None => break,
         }
     }
@@ -707,7 +718,7 @@ mod tests {
         input.push(para("sibling", Some(RowInfo { in_table: true, depth: 1, cell_mark: true, ..Default::default() })));
         input.push(para(
             "",
-            Some(RowInfo { in_table: true, depth: 1, cell_mark: true, ttp: true, edges: vec![0.0, 72.0, 144.0], ..Default::default() }),
+            Some(RowInfo { in_table: true, depth: 1, cell_mark: true, ttp: true, edges: vec![0, 1440, 2880], ..Default::default() }),
         ));
         input.push(para("tail", None));
         let blocks = assemble(input);
