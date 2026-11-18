@@ -312,10 +312,12 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
 /// a near-full paragraph buffer per depth on large, deeply nested documents.
 fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, level: u32) -> Blocks {
     let mut out: Blocks = Vec::new();
-    let mut rows: Vec<Row> = Vec::new();
+    // Rows are finalized in two phases: cell marks collect raw cells plus the row's own
+    // `sprmTDefTable` edges; flush_table derives one table-wide grid (the union of every
+    // row's edges, as Word does when it saves) and maps each row onto it.
+    let mut rows_raw: Vec<(Vec<Cell>, Box<RowInfo>, bool)> = Vec::new();
     let mut cells: Vec<Cell> = Vec::new();
     let mut cell: Blocks = Vec::new();
-    let mut grid: Vec<f32> = Vec::new();
     let mut props = TableProps::default();
     let mut open = false;
 
@@ -326,8 +328,15 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
         }
         cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks, controls: Default::default() });
     }
-    fn build_row(mut cells: Vec<Cell>, info: &RowInfo) -> Row {
-        // Per-cell overrides first (sprm cell indices count pre-merge cells), then merges.
+    /// Map one row's cells onto the unified grid from its own TDefTable edges: a cell
+    /// spans every grid column whose left edge falls inside it, zero-width edges are
+    /// shadows folded into the previous cell, horizontal merges span the sum of the cells
+    /// they join, and a row narrower than the table gains empty leading/trailing cells
+    /// (LibreOffice's empty edge columns) so every row spans the whole grid.
+    fn finish_row(cells: Vec<Cell>, info: &RowInfo, unified: &[f32]) -> Row {
+        let mut cells = cells;
+        // Per-cell overrides first (sprm cell indices count pre-merge cells); merges map
+        // below, after spans, so they span the sum of the cells they join.
         for (i, c) in cells.iter_mut().enumerate() {
             let i = i as u8;
             if let Some((_, m)) = info.vmerge.iter().find(|(k, _)| *k == i) {
@@ -346,13 +355,57 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
                 c.props.valign = Some(*v);
             }
         }
+        let edges = &info.edges;
+        if edges.len() >= 2 && cells.len() + 1 == edges.len() {
+            // Spans first, in row-column space; merges below sum them.
+            let span_of = |i: usize| -> u32 {
+                let (a, b) = (edges[i], edges[i + 1]);
+                unified.iter().filter(|&&g| g >= a - 0.01 && g < b - 0.01).count() as u32
+            };
+            for i in 0..cells.len() {
+                let span = span_of(i);
+                if span == 0 && i > 0 {
+                    // A zero-width edge pair is a shadow cell: fold it into the previous one.
+                    let (left, right) = cells.split_at_mut(i);
+                    let prev = left.last_mut().expect("i > 0");
+                    prev.blocks.extend(right[0].blocks.drain(..).filter(|x| x.as_para().is_none_or(|p| !p.is_empty())));
+                    right[0].props.span = 0;
+                } else {
+                    cells[i].props.span = span.clamp(1, 63);
+                }
+            }
+            cells.retain(|c| c.props.span > 0);
+            // The row's leading edge may sit right of the table's (an indented row): an
+            // empty cell covers the columns before it, another covers the ones after it.
+            let mut spans: u32 = cells.iter().map(|c| c.props.span).sum();
+            let grid_cols = unified.len().saturating_sub(1) as u32;
+            if grid_cols > 0 {
+                if edges[0] > unified[0] + 0.01 {
+                    let lead = unified.iter().filter(|&&g| g < edges[0] - 0.01).count() as u32;
+                    if lead > 0 {
+                        spans += lead;
+                        cells.insert(0, Cell { props: CellProps { span: lead.min(63), ..Default::default() }, blocks: vec![para_block(Paragraph::new())], controls: Default::default() });
+                    }
+                }
+                if spans < grid_cols {
+                    cells.push(Cell { props: CellProps { span: (grid_cols - spans).min(63), ..Default::default() }, blocks: vec![para_block(Paragraph::new())], controls: Default::default() });
+                }
+            }
+        }
+        if std::env::var_os("CRAFT_DOCBIN_DEBUG").is_some() {
+            eprintln!("[finish] edges={edges:?} cells={} spans={:?} merges={:?} unified={}cols", cells.len(), cells.iter().map(|c| c.props.span).collect::<Vec<_>>(), info.merges, unified.len().saturating_sub(1));
+        }
+        // Horizontal merges: (itcFirst, itcLim) ranges in pre-merge cell indices; the
+        // merged cell spans the sum of the cells it joins.
+        let mut cells = cells;
         for &(a, b) in info.merges.iter().take(MAX_COLS) {
             let a = a as usize;
             let b = (b as usize).min(cells.len());
             if a < b && b <= cells.len() && b - a > 1 {
+                let span: u32 = cells[a..b].iter().map(|c| c.props.span).sum();
                 let removed: Vec<Cell> = cells.drain(a + 1..b).collect();
                 if let Some(first) = cells.get_mut(a) {
-                    first.props.span = ((b - a) as u32).min(63);
+                    first.props.span = span.clamp(1, 63);
                     for c in removed {
                         first.blocks.extend(c.blocks.into_iter().filter(|x| x.as_para().is_none_or(|p| !p.is_empty())));
                     }
@@ -374,20 +427,47 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
             controls: Default::default(),
         }
     }
-    fn flush_table(out: &mut Blocks, rows: &mut Vec<Row>, cells: &mut Vec<Cell>, cell: &mut Blocks, grid: &[f32], props: &TableProps) {
+
+    fn flush_table(out: &mut Blocks, rows_raw: &mut Vec<(Vec<Cell>, Box<RowInfo>, bool)>, cells: &mut Vec<Cell>, cell: &mut Blocks, props: &TableProps) {
         if !cells.is_empty() || !cell.is_empty() {
             flush_cell(cells, cell);
-            // A stray trailing row (no TTP of its own): size its cells from the grid.
-            let mut stray = build_row(std::mem::take(cells), &RowInfo::default());
-            for (i, c) in stray.cells.iter_mut().enumerate() {
-                if c.props.width.is_none() && c.props.span == 1 {
-                    c.props.width = grid.get(i).copied();
+            // A stray trailing row (no row end of its own) keeps today's shape: one span-1
+            // cell per column of the grid, sized by the grid where it has one.
+            rows_raw.push((std::mem::take(cells), Box::new(RowInfo::default()), true));
+        }
+        if rows_raw.is_empty() {
+            return;
+        }
+        // One grid for the whole table, as Word saves one: the union of every row's
+        // `sprmTDefTable` edges, sorted and deduplicated. Rows may redefine the grid
+        // per row (LibreOffice's bands); the union lets each row's own segmentation map
+        // onto shared columns. Rows without any edges contribute nothing.
+        let mut unified: Vec<f32> = rows_raw.iter().filter(|(_, i, _)| i.edges.len() >= 2).flat_map(|(_, i, _)| i.edges.iter().copied()).collect();
+        unified.retain(|e| e.is_finite());
+        unified.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        unified.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        if unified.len() < 2 || unified.len() > MAX_COLS + 1 {
+            // Degenerate or over-wide unions fall back to the first row that has edges.
+            unified = rows_raw.iter().find(|(_, i, _)| i.edges.len() >= 2).map_or(Vec::new(), |(_, i, _)| {
+                let mut e: Vec<f32> = i.edges.iter().copied().filter(|x| x.is_finite()).collect();
+                e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                e.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+                e
+            });
+        }
+        let grid: Vec<f32> = unified.windows(2).map(|w| (w[1] - w[0]).max(0.0)).take(MAX_COLS).collect();
+        let mut rows: Vec<Row> = Vec::with_capacity(rows_raw.len());
+        for (cells, info, stray) in rows_raw.drain(..) {
+            let mut row = finish_row(cells, &info, &unified);
+            // A stray trailing row (no row end of its own): size its cells from the grid.
+            if stray {
+                for (i, c) in row.cells.iter_mut().enumerate() {
+                    if c.props.width.is_none() && c.props.span == 1 {
+                        c.props.width = grid.get(i).copied();
+                    }
                 }
             }
-            rows.push(stray);
-        }
-        if rows.is_empty() {
-            return;
+            rows.push(row);
         }
         // A table whose rows carry no width intent (no `sprmTCellWidth`, no percentage
         // widths) keeps its widths only in the `sprmTDefTable` boundary array. Word shows
@@ -395,20 +475,28 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
         // column, and boundary-only tables (government and exam forms) collapse. Declare
         // the table fixed at its saved total so the grid stands as written.
         let mut props = props.clone();
-        if !rows.iter().any(|r| r.cells.iter().any(|c| c.props.width.is_some() || c.props.width_pct.is_some())) {
+        if !grid.is_empty() && !rows.iter().any(|r| r.cells.iter().any(|c| c.props.width.is_some() || c.props.width_pct.is_some())) {
             props.fixed = true;
             props.width = Some(grid.iter().sum());
         }
         out.push(Arc::new(Block::Table(Table {
             props,
-            grid: grid.to_vec(),
-            rows: std::mem::take(rows),
+            grid,
+            rows,
             controls: Default::default(),
         })));
     }
 
+    let dbg = std::env::var_os("CRAFT_DOCBIN_DEBUG").is_some();
     while let Some(next) = paras.peek() {
         let next_level = next.row.as_ref().map_or(0, |r| r.level());
+        if dbg && next.row.is_some() {
+            let r = next.row.as_ref().unwrap();
+            eprintln!(
+                "[mark] lvl={} in_table={} ttp={} cell_mark={} inner_cell={} inner_ttp={} edges={} depth={} text={:?}",
+                r.level(), r.in_table, r.ttp, r.cell_mark, r.inner_cell, r.inner_ttp, r.edges.len(), r.depth, next.para.text.as_str().chars().take(12).collect::<String>()
+            );
+        }
         if level > 1 && next_level < level {
             break;
         }
@@ -417,17 +505,37 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
             cell.extend(assemble_at(paras, level + 1));
             continue;
         }
-        let Some(p) = paras.next() else { break };
+        let Some(mut p) = paras.next() else { break };
         if next_level > level {
             // Beyond the depth cap, preserve the text in the deepest cell we build.
             open = true;
             cell.push(para_block(p.para));
             continue;
         }
+        // A cell mark with no table context at all: Word still ends the open row with it
+        // (Aspose-written tables terminate rows with a naked 0x07 whose PAPX carries no
+        // table sprm), and a naked 0x07 outside any table is a plain paragraph, not the
+        // one-cell table today's code would invent from it.
+        if p.row.as_ref().is_some_and(|r| {
+            r.cell_mark && !r.in_table && !r.ttp && !r.inner_cell && !r.inner_ttp && r.depth == 0 && p.para.text.is_empty()
+        }) {
+            if !open {
+                out.push(para_block(p.para));
+                paras.next();
+                continue;
+            }
+            if !cells.is_empty() || !cell.is_empty() {
+                if !cell.is_empty() {
+                    flush_cell(&mut cells, &mut cell);
+                }
+                rows_raw.push((std::mem::take(&mut cells), p.row.take().unwrap_or_default(), false));
+            }
+            paras.next();
+            continue;
+        }
         let Some(info) = p.row else {
             if open {
-                flush_table(&mut out, &mut rows, &mut cells, &mut cell, &grid, &props);
-                grid.clear();
+                flush_table(&mut out, &mut rows_raw, &mut cells, &mut cell, &props);
                 // Table props are per-table (first row carrying the sprm wins within the
                 // table): reset the accumulator so one table's borders, align, indent and
                 // cell margins never leak into the next (the repro's first table wrote
@@ -440,10 +548,6 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
             continue;
         };
         open = true;
-        if grid.is_empty() {
-            // Column widths from the table's first `sprmTDefTable`.
-            grid = info.edges.windows(2).take(MAX_COLS).map(|w| (w[1] - w[0]).max(0.0)).collect();
-        }
         if info.borders.is_some() && props.borders.is_none() {
             props.borders = info.borders;
         }
@@ -474,16 +578,15 @@ fn assemble_at(paras: &mut std::iter::Peekable<impl Iterator<Item = ParaOut>>, l
             if !row_end_only {
                 flush_cell(&mut cells, &mut cell);
             }
-            if row_end {
-                let row = build_row(std::mem::take(&mut cells), &info);
-                rows.push(row);
+            if row_end && (!cells.is_empty() || !cell.is_empty()) {
+                rows_raw.push((std::mem::take(&mut cells), info, false));
             }
         } else {
             cell.push(para_block(p.para));
         }
     }
     if open {
-        flush_table(&mut out, &mut rows, &mut cells, &mut cell, &grid, &props);
+        flush_table(&mut out, &mut rows_raw, &mut cells, &mut cell, &props);
     }
     out
 }

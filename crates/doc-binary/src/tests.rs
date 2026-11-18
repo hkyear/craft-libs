@@ -1414,9 +1414,11 @@ fn table_merges_borders_shading() {
     let doc = read(&struct_doc(&spec)).expect("opens");
     let tbl = doc.body.iter().find_map(|b| b.as_table()).expect("table");
     assert_eq!(tbl.rows.len(), 2);
-    // Row 1: three cell marks merged to two cells, the first spanning two columns.
+    // Row 1: three cell marks merged to two cells. The unified grid is the union of both
+    // rows' TDefTable edges ([0, 1920, 2880, 3840, 5760] = 4 columns); the first cell
+    // covers [0, 3840) = three grid columns.
     assert_eq!(tbl.rows[0].cells.len(), 2);
-    assert_eq!(tbl.rows[0].cells[0].span(), 2);
+    assert_eq!(tbl.rows[0].cells[0].span(), 3);
     let r0 = tbl.rows[0].cells[0].blocks.iter().filter_map(|b| b.as_para()).map(|p| p.text.clone()).collect::<String>();
     assert_eq!(r0, "ab");
     // Row 2: shading, vertical-merge restart, exact height 20pt.

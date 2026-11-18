@@ -730,6 +730,9 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                     combined = v;
                     &combined
                 };
+                if std::env::var_os("CRAFT_DOCBIN_DEBUG").is_some() && c == '\u{7}' {
+                    eprintln!("[papx] cp={cp} istd={istd} len={} bytes={:02x?}", papx.len(), &papx[..papx.len().min(48)]);
+                }
                 if let Some(st) = ctx.raw_styles.get(istd as usize).filter(|s| !s.name.is_empty()) {
                     pb.props.style = Some(fmt::style_id(&st.name));
                 }
